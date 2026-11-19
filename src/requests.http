@@ -1,4 +1,4 @@
-POST http://localhost:3000/api/games/join
+POST http://localhost:3001/api/games/join
 Content-Type: application/json
 
 {

@@ -1,6 +1,6 @@
 'use client';
 import { useState, useEffect, useSyncExternalStore } from 'react';
-import { socket } from '@/lib/socket';
+import { API_URL, socket } from '@/lib/socket';
 
 interface Challenge {
   id: number;
@@ -97,7 +97,7 @@ export default function Home() {
     setErrorMsg('');
 
     try {
-      const res = await fetch('http://localhost:3000/api/games/create', {
+      const res = await fetch(`${API_URL}/api/games/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: 1 }),
@@ -127,7 +127,7 @@ export default function Home() {
 
     try {
       const code = inputCode.toUpperCase();
-      const res = await fetch('http://localhost:3000/api/games/join', {
+      const res = await fetch(`${API_URL}/api/games/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code, userId: 2 }),
