@@ -84,7 +84,9 @@ io.on('connection', (socket) => {
       hostId: room.hostId
     });
 
-    // Asignar reto inicial automáticamente al entrar
+    // Asignar reto inicial automáticamente al entrar    const randomPlayer = room.players.length > 0 
+      ? room.players[Math.floor(Math.random() * room.players.length)].username 
+      : username;
     try {
       const result = await pool.query('SELECT * FROM challenges ORDER BY RANDOM() LIMIT 1');
       if (result.rows.length > 0) {
