@@ -1,0 +1,7 @@
+POST http://localhost:3000/api/games/join
+Content-Type: application/json
+
+{
+  "code": "1G6G",
+  "userId": 3
+}
