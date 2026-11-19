@@ -1,5 +1,6 @@
 import {type Request, type Response } from 'express';
 import { pool } from './db.js';
+import { claimGuest, releaseGuest } from './guestSessions.js';
 
 // Función para generar un código aleatorio de sala (ej. "A4F2")
 function generateRoomCode(): string {
@@ -13,26 +14,24 @@ function generateRoomCode(): string {
 
 // 1. Endpoint para crear una nueva sala de juego
 export async function createGameSession(req: Request, res: Response) {
-  const { username } = req.body;
-  let { userId } = req.body;
+  const { username } = req.body ?? {};
 
-  if (!userId && (typeof username !== 'string' || !username.trim())) {
-    return res.status(400).json({ error: 'Se requiere el nombre o userId del anfitrión' });
+  if (typeof username !== 'string' || !username.trim()) {
+    return res.status(400).json({ error: 'Se requiere el nombre del anfitrión' });
   }
 
   let client;
+  let credential: { roomCode: string; userId: string; token: string } | undefined;
   try {
     client = await pool.connect();
     await client.query('BEGIN'); // Iniciamos una transacción SQL
 
-    if (!userId) {
-      const user = await client.query(
-        `INSERT INTO users (username) VALUES ($1)
-         ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username RETURNING id`,
-        [username.trim()]
-      );
-      userId = user.rows[0].id;
-    }
+    const user = await client.query(
+      `INSERT INTO users (username) VALUES ($1)
+       ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username RETURNING id`,
+      [username.trim()]
+    );
+    const userId = String(user.rows[0].id);
     const roomCode = generateRoomCode();
 
     // Creamos la sesión de juego
@@ -51,16 +50,21 @@ export async function createGameSession(req: Request, res: Response) {
     `;
     await client.query(playerQuery, [newSession.id, userId]);
 
+    const guest = claimGuest(roomCode, userId);
+    if (!guest) throw new Error('No se pudo crear la sesión temporal del anfitrión.');
+    credential = { roomCode, userId, token: guest.token };
     await client.query('COMMIT'); // Confirmamos la transacción
 
     return res.status(201).json({
       message: '¡Sala de juego creada con éxito!',
       session: newSession,
-      userId
+      userId,
+      guestToken: guest.token
     });
 
   } catch (error) {
     if (client) await client.query('ROLLBACK');
+    if (credential) releaseGuest(credential.roomCode, credential.userId, credential.token);
     console.error('Error al crear la sesión de juego:', error);
     return res.status(500).json({ error: 'Error interno al crear la sala' });
   } finally {
@@ -70,15 +74,16 @@ export async function createGameSession(req: Request, res: Response) {
 
 // 2. Endpoint para unirse a una sala existente mediante el código
 export async function joinGameSession(req: Request, res: Response) {
-  const { code, username } = req.body;
-  let { userId } = req.body;
+  const { code, username, guestToken } = req.body ?? {};
 
   if (typeof code !== 'string' || !code.trim() ||
-      (!userId && (typeof username !== 'string' || !username.trim()))) {
-    return res.status(400).json({ error: 'Se requiere el código de la sala y el nombre o userId' });
+      typeof username !== 'string' || !username.trim() ||
+      (guestToken !== undefined && typeof guestToken !== 'string')) {
+    return res.status(400).json({ error: 'Se requiere el código de la sala y el nombre' });
   }
 
   let client;
+  let newCredential: { userId: string; token: string } | undefined;
   try {
     client = await pool.connect();
     await client.query('BEGIN');
@@ -94,14 +99,18 @@ export async function joinGameSession(req: Request, res: Response) {
     }
 
     const session = sessionResult.rows[0];
-    if (!userId) {
-      const user = await client.query(
-        `INSERT INTO users (username) VALUES ($1)
-         ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username RETURNING id`,
-        [username.trim()]
-      );
-      userId = user.rows[0].id;
+    const user = await client.query(
+      `INSERT INTO users (username) VALUES ($1)
+       ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username RETURNING id`,
+      [username.trim()]
+    );
+    const userId = String(user.rows[0].id);
+    const guest = claimGuest(code, userId, guestToken);
+    if (!guest) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'Este nombre ya está en uso en la sala.' });
     }
+    if (guest.created) newCredential = { userId, token: guest.token };
 
     // 2. Verificamos si el usuario ya está en esta sala para evitar duplicados
     const existingPlayer = await client.query(
@@ -123,11 +132,13 @@ export async function joinGameSession(req: Request, res: Response) {
       message: '¡Te has unido a la sala exitosamente!',
       sessionId: session.id,
       code: code,
-      userId
+      userId,
+      guestToken: guest.token
     });
 
   } catch (error) {
     if (client) await client.query('ROLLBACK');
+    if (newCredential) releaseGuest(code, newCredential.userId, newCredential.token);
     console.error('Error al unirse a la sala:', error);
     return res.status(500).json({ error: 'Error interno al unirse a la sala' });
   } finally {

@@ -6,6 +6,7 @@ import dotenv from 'dotenv';
 import { pool } from './db.js';
 import gameRoutes from './gameRoutes.js';
 import { advanceRules, setChallenge, type Challenge, type RoomState } from './gameState.js';
+import { releaseGuest, verifyGuest } from './guestSessions.js';
 
 dotenv.config();
 
@@ -29,6 +30,7 @@ function emitState(roomCode: string, room: RoomState) {
       id, username, score, connected: socketId !== null
     })),
     hostId: room.hostId,
+    hostPlayerId: room.hostPlayerId,
     status: room.status,
     challenge: room.challenge,
     challengeCompleted: room.challengeCompleted,
@@ -113,39 +115,56 @@ async function nextChallenge(socket: Socket, roomCode: string, room: RoomState, 
   }
 }
 
-function leaveRoom(socket: Socket, roomCode: string) {
+function leaveRoom(socket: Socket, roomCode: string, explicit = false) {
   const room = rooms.get(roomCode);
   const player = room?.players.find(p => p.socketId === socket.id);
   if (!room || !player) return;
   player.socketId = null;
+  const token: string | undefined = socket.data.guestTokens?.get(roomCode);
+  if (explicit && token) releaseGuest(roomCode, player.id, token);
+  socket.data.guestTokens?.delete(roomCode);
   void socket.leave(roomCode);
   if (room.hostId === socket.id) {
-    room.hostId = room.players.find(p => p.socketId !== null)?.socketId ?? '';
+    const nextHost = room.players.find(p => p.socketId !== null);
+    room.hostId = nextHost?.socketId ?? '';
+    room.hostPlayerId = nextHost?.id ?? null;
   }
   emitState(roomCode, room);
 }
 
 io.on('connection', socket => {
-  socket.on('join_room', async (data: { roomCode: string; userId: string }, callback?: (result: { error?: string }) => void) => {
+  socket.on('join_room', async (data: { roomCode: string; userId: string; guestToken: string }, callback?: (result: { error?: string }) => void) => {
     const reject = (message: string) => {
       if (callback) callback({ error: message });
       else error(socket, message);
     };
-    if (!data || typeof data.roomCode !== 'string' || typeof data.userId !== 'string' ||
+    if (!data || typeof data.roomCode !== 'string' || typeof data.userId !== 'string' || typeof data.guestToken !== 'string' ||
         !/^\d+$/.test(data.userId)) {
       reject('Datos de sala inválidos.');
       return;
     }
-    const { roomCode, userId } = data;
+    const { roomCode, userId, guestToken } = data;
+    if (!verifyGuest(roomCode, userId, guestToken)) {
+      reject('La sesión de invitado no es válida. Vuelve a unirte a la sala.');
+      return;
+    }
     try {
       const membership = await pool.query(
-        `SELECT u.username FROM game_sessions s
+        `SELECT u.username, (
+           SELECT host.user_id::text FROM session_players host
+           WHERE host.session_id = s.id AND host.is_host = TRUE
+           ORDER BY host.joined_at LIMIT 1
+         ) AS host_user_id FROM game_sessions s
          JOIN session_players sp ON sp.session_id = s.id
          JOIN users u ON u.id = sp.user_id
          WHERE s.code = $1 AND s.status = 'waiting' AND u.id = $2`,
         [roomCode, userId]
       );
       if (!socket.connected) return;
+      if (!verifyGuest(roomCode, userId, guestToken)) {
+        reject('La sesión de invitado ya no es válida. Vuelve a unirte a la sala.');
+        return;
+      }
       if (!membership.rows[0]) {
         reject('No estás registrado en esta sala.');
         return;
@@ -154,7 +173,8 @@ io.on('connection', socket => {
       let room = rooms.get(roomCode);
       if (!room) {
         room = {
-          players: [], hostId: socket.id, status: 'playing', challenge: null, challengeCompleted: false, turnId: null,
+          players: [], hostId: '', hostPlayerId: membership.rows[0].host_user_id,
+          status: 'playing', challenge: null, challengeCompleted: false, turnId: null,
           assignedPlayerId: null, rules: [], timerEndsAt: null, timerStatus: 'idle', advancing: false
         };
         rooms.set(roomCode, room);
@@ -170,7 +190,10 @@ io.on('connection', socket => {
       } else {
         player.socketId = socket.id;
       }
-      if (!room.hostId) room.hostId = socket.id;
+      if (room.hostPlayerId === null) room.hostPlayerId = userId;
+      if (room.hostPlayerId === userId) room.hostId = socket.id;
+      if (!socket.data.guestTokens) socket.data.guestTokens = new Map<string, string>();
+      socket.data.guestTokens.set(roomCode, guestToken);
       await socket.join(roomCode);
       if (!socket.connected || player.socketId !== socket.id) return;
       callback?.({});
@@ -253,8 +276,25 @@ io.on('connection', socket => {
     if (room) void nextChallenge(socket, roomCode, room, false, true);
   });
 
+  socket.on('transfer_host', (data: { roomCode: string; playerId: string }) => {
+    if (!data || typeof data.roomCode !== 'string' || typeof data.playerId !== 'string') {
+      error(socket, 'Datos de transferencia inválidos.');
+      return;
+    }
+    const room = hostRoom(socket, data.roomCode);
+    if (!room) return;
+    const target = room.players.find(player => player.id === data.playerId);
+    if (!target?.socketId || target.socketId === socket.id) {
+      error(socket, 'Selecciona otro jugador conectado.');
+      return;
+    }
+    room.hostId = target.socketId;
+    room.hostPlayerId = target.id;
+    emitState(data.roomCode, room);
+  });
+
   socket.on('leave_room', (roomCode: string) => {
-    if (typeof roomCode === 'string') leaveRoom(socket, roomCode);
+    if (typeof roomCode === 'string') leaveRoom(socket, roomCode, true);
   });
 
   socket.on('disconnect', () => {

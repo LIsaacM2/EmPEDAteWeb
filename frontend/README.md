@@ -24,5 +24,11 @@ cada reto. La partida finaliza con el podio, pero la sala permanece abierta;
 el anfitrión puede iniciar otra partida con los puntos y reglas reiniciados.
 
 El estado y los puntos viven en la memoria del servidor y se pierden al
-reiniciarlo. Los nombres se reutilizan para volver a la sala; todavía no hay
-autenticación de jugadores.
+reiniciarlo. No hace falta crear una cuenta: cada invitado usa un nombre y una
+credencial temporal guardada en su navegador para volver a la sala. El mismo
+nombre no puede usarse simultáneamente por dos invitados de la misma sala.
+El anfitrión puede designar a otro jugador conectado desde la lista; si sale o
+se desconecta, el rol pasa al siguiente jugador conectado por orden de entrada.
+
+Si aparece el error de que se requiere el `userId` del anfitrión, detén el
+backend anterior y vuelve a iniciarlo desde la raíz con `npm run dev`.

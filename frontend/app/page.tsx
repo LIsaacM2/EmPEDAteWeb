@@ -29,6 +29,7 @@ interface RoomState {
   roomCode: string;
   players: Player[];
   hostId: string;
+  hostPlayerId: string | null;
   status: 'playing' | 'finished';
   challenge: Challenge | null;
   challengeCompleted: boolean;
@@ -48,12 +49,17 @@ function subscribeToConnection(onChange: () => void) {
   };
 }
 
+function guestStorageKey(code: string, name: string) {
+  return `empedate:guest:${code}:${name.trim()}`;
+}
+
 export default function Home() {
   const isConnected = useSyncExternalStore(subscribeToConnection, () => socket.connected, () => false);
   const [username, setUsername] = useState('');
   const [inputCode, setInputCode] = useState('');
   const [roomCode, setRoomCode] = useState('');
   const [userId, setUserId] = useState('');
+  const [guestToken, setGuestToken] = useState('');
   const [inRoom, setInRoom] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
@@ -78,9 +84,9 @@ export default function Home() {
   }, [roomCode]);
 
   useEffect(() => {
-    if (!inRoom || !roomCode || !userId) return;
+    if (!inRoom || !roomCode || !userId || !guestToken) return;
     const join = () => {
-      socket.emit('join_room', { roomCode, userId }, (result: { error?: string }) => {
+      socket.emit('join_room', { roomCode, userId, guestToken }, (result: { error?: string }) => {
         if (result.error) {
           setErrorMsg(result.error);
           setInRoom(false);
@@ -90,7 +96,7 @@ export default function Home() {
     socket.on('connect', join);
     if (socket.connected) join();
     return () => { socket.off('connect', join); };
-  }, [inRoom, roomCode, userId]);
+  }, [inRoom, roomCode, userId, guestToken]);
 
   const handleCreateRoom = async () => {
     if (!username) {
@@ -109,11 +115,19 @@ export default function Home() {
       const data = await res.json();
       if (res.ok) {
         const generatedCode = data.session?.code || data.code;
+        if (typeof generatedCode !== 'string' || typeof data.guestToken !== 'string' || !data.userId) {
+          setErrorMsg('El servidor no tiene la versión actual. Reinicia el backend e inténtalo de nuevo.');
+          return;
+        }
+        localStorage.setItem(guestStorageKey(generatedCode, username), data.guestToken);
         setRoomCode(generatedCode);
         setUserId(String(data.userId));
+        setGuestToken(data.guestToken);
         setInRoom(true);
       } else {
-        setErrorMsg(data.error || 'Error al crear la sala');
+        setErrorMsg(data.error === 'Se requiere el userId del anfitrión'
+          ? 'El backend está desactualizado. Reinícialo e inténtalo de nuevo.'
+          : data.error || 'Error al crear la sala');
       }
     } catch (err) {
       console.error(err);
@@ -130,16 +144,23 @@ export default function Home() {
 
     try {
       const code = inputCode.toUpperCase();
+      const savedToken = localStorage.getItem(guestStorageKey(code, username));
       const res = await fetch(`${API_URL}/api/games/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, username: username.trim() }),
+        body: JSON.stringify({ code, username: username.trim(), ...(savedToken ? { guestToken: savedToken } : {}) }),
       });
 
       const data = await res.json();
       if (res.ok) {
+        if (typeof data.guestToken !== 'string' || !data.userId) {
+          setErrorMsg('El servidor no tiene la versión actual. Reinicia el backend e inténtalo de nuevo.');
+          return;
+        }
+        localStorage.setItem(guestStorageKey(code, username), data.guestToken);
         setRoomCode(code);
         setUserId(String(data.userId));
+        setGuestToken(data.guestToken);
         setInRoom(true);
       } else {
         setErrorMsg(data.error || 'Error al unirse a la sala');
@@ -237,9 +258,20 @@ export default function Home() {
               <p className="text-xs font-bold text-slate-400 uppercase mb-2">Jugadores en la sala ({players.filter(p => p.connected).length}):</p>
               <div className="flex flex-wrap gap-2">
                 {players.map((p) => (
-                  <span key={p.id} className="text-xs bg-purple-950/80 border border-purple-800 text-purple-200 px-3 py-1 rounded-full font-medium">
-                    {p.username} {p.id === userId ? '(Tú)' : ''} {!p.connected ? '(Desconectado)' : ''} · {p.score} pts
-                  </span>
+                  <div key={p.id} className="text-xs bg-purple-950/80 border border-purple-800 text-purple-200 px-3 py-1 rounded-xl font-medium">
+                    <span>{p.id === room?.hostPlayerId ? '👑 ' : ''}{p.username} {p.id === userId ? '(Tú)' : ''} {!p.connected ? '(Desconectado)' : ''} · {p.score} pts</span>
+                    {isHost && p.id !== userId && p.connected && (
+                      <button
+                        type="button"
+                        onClick={() => socket.emit('transfer_host', { roomCode, playerId: p.id })}
+                        disabled={!isConnected}
+                        className="ml-2 underline text-purple-300 hover:text-white disabled:opacity-50"
+                        aria-label={`Hacer anfitrión a ${p.username}`}
+                      >
+                        Hacer anfitrión
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
             </div>

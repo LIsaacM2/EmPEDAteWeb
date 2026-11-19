@@ -28,6 +28,7 @@ export interface ActiveRule {
 export interface RoomState {
   players: Player[];
   hostId: string;
+  hostPlayerId: string | null;
   status: 'playing' | 'finished';
   challenge: Challenge | null;
   challengeCompleted: boolean;
