@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 
+// Las credenciales temporales vinculan cada invitado a una sala sin exigir un login.
 const credentials = new Map<string, Map<string, string>>();
 
 export function claimGuest(roomCode: string, userId: string, token?: string): { token: string; created: boolean } | null {

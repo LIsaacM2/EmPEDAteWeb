@@ -2,13 +2,10 @@ import express from 'express';
 import http from 'http';
 import { Server, type Socket } from 'socket.io';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import { pool } from './db.js';
 import gameRoutes from './gameRoutes.js';
 import { advanceRules, setChallenge, type Challenge, type RoomState } from './gameState.js';
 import { releaseGuest, verifyGuest } from './guestSessions.js';
-
-dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
@@ -21,9 +18,11 @@ app.use(express.json());
 app.use('/api/games', gameRoutes);
 
 const PORT = process.env.PORT || 3001;
+// Las salas, los puntos y los temporizadores son estado autoritativo en memoria.
 const rooms = new Map<string, RoomState>();
 
 function emitState(roomCode: string, room: RoomState) {
+  // Solo se expone el socketId del anfitrión; las credenciales permanecen privadas.
   io.to(roomCode).emit('update_room_state', {
     roomCode,
     players: room.players.map(({ id, username, score, socketId }) => ({
@@ -49,6 +48,7 @@ function error(socket: Socket, message: string) {
 }
 
 function hostRoom(socket: Socket, roomCode: unknown): RoomState | undefined {
+  // La autorización se comprueba en el servidor, no en la visibilidad de los botones.
   const room = typeof roomCode === 'string' ? rooms.get(roomCode) : undefined;
   if (!room || room.hostId !== socket.id || !room.players.some(player => player.socketId === socket.id)) {
     error(socket, 'Solo el anfitrión de la sala puede realizar esta acción.');
@@ -83,6 +83,7 @@ async function nextChallenge(socket: Socket, roomCode: string, room: RoomState, 
     return;
   }
 
+  // Bloquea avances simultáneos; el punto se conserva aunque falle la siguiente consulta.
   room.advancing = true;
   try {
     if (completed) {
@@ -124,6 +125,7 @@ function leaveRoom(socket: Socket, roomCode: string, explicit = false) {
   if (explicit && token) releaseGuest(roomCode, player.id, token);
   socket.data.guestTokens?.delete(roomCode);
   void socket.leave(roomCode);
+  // El siguiente jugador conectado, según el orden de entrada, recibe el rol.
   if (room.hostId === socket.id) {
     const nextHost = room.players.find(p => p.socketId !== null);
     room.hostId = nextHost?.socketId ?? '';
@@ -133,6 +135,7 @@ function leaveRoom(socket: Socket, roomCode: string, explicit = false) {
 }
 
 io.on('connection', socket => {
+  // Comprueba la credencial y la membresía antes de incorporar el socket a la sala.
   socket.on('join_room', async (data: { roomCode: string; userId: string; guestToken: string }, callback?: (result: { error?: string }) => void) => {
     const reject = (message: string) => {
       if (callback) callback({ error: message });
@@ -172,6 +175,7 @@ io.on('connection', socket => {
 
       let room = rooms.get(roomCode);
       if (!room) {
+        // Reserva el rol al creador aunque otro jugador llegue primero por WebSocket.
         room = {
           players: [], hostId: '', hostPlayerId: membership.rows[0].host_user_id,
           status: 'playing', challenge: null, challengeCompleted: false, turnId: null,
@@ -261,6 +265,7 @@ io.on('connection', socket => {
       error(socket, 'La partida ya terminó.');
       return;
     }
+    // Finalizar conserva jugadores y puntos para el podio y no cierra la sala.
     room.status = 'finished';
     room.challenge = null;
     room.turnId = null;
@@ -276,6 +281,7 @@ io.on('connection', socket => {
     if (room) void nextChallenge(socket, roomCode, room, false, true);
   });
 
+  // Solo el anfitrión actual puede transferir el rol a otro jugador conectado.
   socket.on('transfer_host', (data: { roomCode: string; playerId: string }) => {
     if (!data || typeof data.roomCode !== 'string' || typeof data.playerId !== 'string') {
       error(socket, 'Datos de transferencia inválidos.');
@@ -302,6 +308,7 @@ io.on('connection', socket => {
   });
 });
 
+// El plazo vive en el servidor; cada tick publica el tiempo restante a la sala.
 const timer = setInterval(() => {
   for (const [roomCode, room] of rooms) {
     if (room.timerStatus !== 'running' || room.timerEndsAt === null) continue;

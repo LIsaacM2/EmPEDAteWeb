@@ -1,6 +1,7 @@
 'use client';
 import { useState, useEffect, useSyncExternalStore } from 'react';
 import { API_URL, socket } from '@/lib/socket';
+import { Podium, type PodiumPlayer } from './Podium';
 
 interface Challenge {
   id: string | number;
@@ -11,10 +12,7 @@ interface Challenge {
   duration_value: number; // Valor numérico
 }
 
-interface Player {
-  id: string;
-  username: string;
-  score: number;
+interface Player extends PodiumPlayer {
   connected: boolean;
 }
 
@@ -50,6 +48,7 @@ function subscribeToConnection(onChange: () => void) {
 }
 
 function guestStorageKey(code: string, name: string) {
+  // La credencial es distinta para cada nombre y sala, incluso en el mismo navegador.
   return `empedate:guest:${code}:${name.trim()}`;
 }
 
@@ -69,6 +68,7 @@ export default function Home() {
   const assignedPlayer = players.find(player => player.id === room?.assignedPlayerId);
   const isHost = socket.id === room?.hostId;
 
+  // El servidor envía la instantánea completa de la sala y los errores de juego.
   useEffect(() => {
     const onState = (state: RoomState) => {
       if (state.roomCode === roomCode) setRoom(state);
@@ -83,6 +83,7 @@ export default function Home() {
     };
   }, [roomCode]);
 
+  // Reutiliza la credencial del invitado al reconectarse, sin crear otra membresía.
   useEffect(() => {
     if (!inRoom || !roomCode || !userId || !guestToken) return;
     const join = () => {
@@ -178,7 +179,7 @@ export default function Home() {
         {/* Encabezado y Estado */}
         <div className="flex justify-between items-center mb-6">
           <h1 className="text-2xl font-black bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-500">
-            🍺 Tequila Game
+            🍺 EmPEDAte
           </h1>
           <div className="flex items-center gap-2 bg-slate-800 px-3 py-1 rounded-full border border-slate-700">
             <span className={`h-2.5 w-2.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} />
@@ -294,14 +295,7 @@ export default function Home() {
               {room?.status === 'finished' ? (
                 <div className="space-y-4">
                   <h3 className="text-xl font-bold text-amber-400">🏆 Podio final</h3>
-                  <ol className="space-y-2 text-left">
-                    {[...players].sort((a, b) => b.score - a.score || a.username.localeCompare(b.username)).map((player, index) => (
-                      <li key={player.id} className="flex justify-between rounded-lg bg-slate-900 px-4 py-2">
-                        <span>{index + 1}. {player.username}</span>
-                        <strong>{player.score} {player.score === 1 ? 'punto' : 'puntos'}</strong>
-                      </li>
-                    ))}
-                  </ol>
+                  <Podium players={players} />
                   <p className="text-sm text-slate-400">La sala sigue abierta para nuevos participantes.</p>
                   {isHost && (
                     <button onClick={() => socket.emit('start_game', roomCode)} disabled={!isConnected}

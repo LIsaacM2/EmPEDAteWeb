@@ -50,6 +50,7 @@ export async function createGameSession(req: Request, res: Response) {
     `;
     await client.query(playerQuery, [newSession.id, userId]);
 
+    // La credencial también se libera si la transacción no llega a confirmarse.
     const guest = claimGuest(roomCode, userId);
     if (!guest) throw new Error('No se pudo crear la sesión temporal del anfitrión.');
     credential = { roomCode, userId, token: guest.token };
@@ -105,6 +106,7 @@ export async function joinGameSession(req: Request, res: Response) {
       [username.trim()]
     );
     const userId = String(user.rows[0].id);
+    // Un nombre ya reservado solo puede reutilizarse con su credencial de invitado.
     const guest = claimGuest(code, userId, guestToken);
     if (!guest) {
       await client.query('ROLLBACK');

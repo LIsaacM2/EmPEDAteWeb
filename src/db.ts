@@ -1,11 +1,9 @@
+import 'dotenv/config';
 import pkg from 'pg';
 const { Pool } = pkg;
 
-// Configuración centralizada de la base de datos
+// pg lee PGHOST, PGPORT, PGUSER y PGPASSWORD del entorno.
 export const pool = new Pool({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'empedate_game_db',
-  password: 'PokeTaco21.', // Cambia esto por tu contraseña real
-  port: 5432,
+  user: process.env.PGUSER || 'postgres',
+  database: process.env.PGDATABASE || 'empedate_game_db',
 });

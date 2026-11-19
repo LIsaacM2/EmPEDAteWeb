@@ -41,11 +41,13 @@ export interface RoomState {
 }
 
 export function advanceRules(room: RoomState): void {
+  // Una ronda termina después de tantas preguntas como participantes conectados haya.
   const participants = room.players.filter(player => player.socketId !== null).length;
   if (participants === 0) return;
 
   for (const rule of room.rules) {
     if (rule.skipCurrent) {
+      // La pregunta que activó la regla no cuenta entre sus preguntas posteriores.
       rule.skipCurrent = false;
       continue;
     }
@@ -59,6 +61,7 @@ export function advanceRules(room: RoomState): void {
 }
 
 export function setChallenge(room: RoomState, challenge: Challenge, player: Player): void {
+  // Cada turno tiene un identificador nuevo para rechazar acciones duplicadas o tardías.
   room.challenge = challenge;
   room.challengeCompleted = false;
   room.turnId = randomUUID();

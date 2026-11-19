@@ -1,14 +1,4 @@
-import pkg from 'pg';
-const { Pool } = pkg;
-
-// Configuración de tu conexión a PostgreSQL
-const pool = new Pool({
-  user: 'postgres',
-  host: 'localhost',
-  database: 'empedate_game_db', // Asegúrate de que sea el nombre de tu BD
-  password: 'PokeTaco21.',   // Cambia esto por tu contraseña real de pgAdmin
-  port: 5432,
-});
+import { pool } from './db.js';
 
 async function runSeed() {
   try {
@@ -39,6 +29,7 @@ async function runSeed() {
     console.log('¡Seeder ejecutado con éxito! Se insertaron los retos de prueba.');
   } catch (error) {
     console.error('Error al ejecutar el seeder:', error);
+    process.exitCode = 1;
   } finally {
     // Cerramos la conexión para que el script termine limpiamente
     await pool.end();
