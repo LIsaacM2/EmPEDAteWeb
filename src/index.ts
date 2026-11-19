@@ -1,180 +1,278 @@
 import express from 'express';
 import http from 'http';
-import { Server } from 'socket.io';
+import { Server, type Socket } from 'socket.io';
 import cors from 'cors';
 import dotenv from 'dotenv';
-
 import { pool } from './db.js';
 import gameRoutes from './gameRoutes.js';
+import { advanceRules, setChallenge, type Challenge, type RoomState } from './gameState.js';
 
 dotenv.config();
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
 app.use(cors());
 app.use(express.json());
-
-// Rutas HTTP
 app.use('/api/games', gameRoutes);
 
 const PORT = process.env.PORT || 3001;
+const rooms = new Map<string, RoomState>();
 
-interface Player {
-  id: string;
-  username: string;
+function emitState(roomCode: string, room: RoomState) {
+  io.to(roomCode).emit('update_room_state', {
+    roomCode,
+    players: room.players.map(({ id, username, score, socketId }) => ({
+      id, username, score, connected: socketId !== null
+    })),
+    hostId: room.hostId,
+    status: room.status,
+    challenge: room.challenge,
+    challengeCompleted: room.challengeCompleted,
+    turnId: room.turnId,
+    assignedPlayerId: room.assignedPlayerId,
+    rules: room.rules.map(({ id, challengeContent, targetUsername, remainingRounds }) => ({
+      id, challengeContent, targetUsername, remainingRounds
+    })),
+    timerStatus: room.timerStatus,
+    timeLeft: room.timerEndsAt === null ? null : Math.max(0, Math.ceil((room.timerEndsAt - Date.now()) / 1000))
+  });
 }
 
-// Interfaz para los efectos activos de un jugador
-interface ActiveEffect {
-  challengeContent: string;
-  remainingRounds: number;
-  targetUsername: string;
+function error(socket: Socket, message: string) {
+  socket.emit('game_error', { message });
 }
 
-// Estructura ampliada para las salas en memoria
-interface RoomState {
-  players: Player[];
-  activeEffects: Record<string, ActiveEffect>;
-  turnIndex: number;
-  hostId: string; // Guardamos el socket.id del anfitrión
+function hostRoom(socket: Socket, roomCode: unknown): RoomState | undefined {
+  const room = typeof roomCode === 'string' ? rooms.get(roomCode) : undefined;
+  if (!room || room.hostId !== socket.id || !room.players.some(player => player.socketId === socket.id)) {
+    error(socket, 'Solo el anfitrión de la sala puede realizar esta acción.');
+    return undefined;
+  }
+  return room;
 }
 
-// Memoria de las salas
-const rooms: Record<string, RoomState> = {};
+async function loadChallenge(): Promise<Challenge> {
+  const result = await pool.query('SELECT * FROM challenges ORDER BY RANDOM() LIMIT 1');
+  const challenge = result.rows[0];
+  if (!challenge) throw new Error('No hay retos disponibles en la base de datos.');
+  if ((challenge.duration_type === 'seconds' || challenge.duration_type === 'rounds') &&
+      (!Number.isInteger(challenge.duration_value) || challenge.duration_value <= 0)) {
+    throw new Error('El reto tiene una duración inválida.');
+  }
+  return challenge;
+}
 
-io.on('connection', (socket) => {
-  console.log(`Nuevo usuario conectado por WebSockets: ${socket.id}`);
+async function nextChallenge(socket: Socket, roomCode: string, room: RoomState, completed: boolean, restart = false, turnId: string | null = null) {
+  if (room.advancing) {
+    error(socket, 'Ya se está cargando un reto.');
+    return;
+  }
+  if ((!restart && (room.status !== 'playing' || room.turnId !== turnId || (completed && !room.challenge))) ||
+      (restart && room.status !== 'finished')) {
+    error(socket, 'No se puede avanzar en el estado actual de la partida.');
+    return;
+  }
+  if (completed && room.challengeCompleted) {
+    error(socket, 'Este reto ya fue marcado como cumplido.');
+    return;
+  }
 
-  socket.on('join_room', async (data: { roomCode: string; username: string }) => {
-    const { roomCode, username } = data;
-    socket.join(roomCode);
-    
-    if (!rooms[roomCode]) {
-      rooms[roomCode] = {
-        players: [],
-        activeEffects: {},
-        turnIndex: 0,
-        hostId: socket.id // El primero que crea/entra es el host inicial
-      };
+  room.advancing = true;
+  try {
+    if (completed) {
+      const assigned = room.players.find(p => p.id === room.assignedPlayerId);
+      if (!assigned) throw new Error('No se encontró al jugador del reto.');
+      assigned.score++;
+      room.challengeCompleted = true;
+      emitState(roomCode, room);
     }
-
-    const room = rooms[roomCode];
-
-    if (!room.players.some(p => p.id === socket.id)) {
-      room.players.push({ id: socket.id, username: username || 'Invitado' });
+    const challenge = await loadChallenge();
+    if (room.hostId !== socket.id || !socket.connected ||
+        (restart ? room.status !== 'finished' : room.status !== 'playing')) return;
+    const connected = room.players.filter(player => player.socketId !== null);
+    const player = connected[Math.floor(Math.random() * connected.length)];
+    if (!player) throw new Error('No hay jugadores conectados.');
+    if (restart) {
+      room.players.forEach(p => { p.score = 0; });
+      room.rules = [];
+      room.status = 'playing';
+    } else if (room.challenge) {
+      advanceRules(room);
     }
+    setChallenge(room, challenge, player);
+    emitState(roomCode, room);
+  } catch (cause) {
+    console.error('Error al cargar el reto:', cause);
+    error(socket, 'No se pudo cargar el siguiente reto. Inténtalo nuevamente.');
+  } finally {
+    room.advancing = false;
+  }
+}
 
-    // Si por alguna razón el host actual se salió o no hay, aseguramos uno
-    const firstPlayer = room.players[0];
-    if (firstPlayer && !room.players.some(p => p.id === room.hostId)) {
-      room.hostId = firstPlayer.id;
+function leaveRoom(socket: Socket, roomCode: string) {
+  const room = rooms.get(roomCode);
+  const player = room?.players.find(p => p.socketId === socket.id);
+  if (!room || !player) return;
+  player.socketId = null;
+  void socket.leave(roomCode);
+  if (room.hostId === socket.id) {
+    room.hostId = room.players.find(p => p.socketId !== null)?.socketId ?? '';
+  }
+  emitState(roomCode, room);
+}
+
+io.on('connection', socket => {
+  socket.on('join_room', async (data: { roomCode: string; userId: string }, callback?: (result: { error?: string }) => void) => {
+    const reject = (message: string) => {
+      if (callback) callback({ error: message });
+      else error(socket, message);
+    };
+    if (!data || typeof data.roomCode !== 'string' || typeof data.userId !== 'string' ||
+        !/^\d+$/.test(data.userId)) {
+      reject('Datos de sala inválidos.');
+      return;
     }
-
-    console.log(`Usuario ${username} unido a la sala: ${roomCode}`);
-    
-    // Emitimos la lista de jugadores y el id del host actual a todos en la sala
-    io.to(roomCode).emit('update_room_state', {
-      players: room.players,
-      hostId: room.hostId
-    });
-
-    // Asignar reto inicial automáticamente al entrar
+    const { roomCode, userId } = data;
     try {
-      const result = await pool.query('SELECT * FROM challenges ORDER BY RANDOM() LIMIT 1');
-      if (result.rows.length > 0) {
-        const randomChallenge = result.rows[0];
-        const players = room.players;
-        const randomPlayer = players[Math.floor(Math.random() * players.length)];
-        if (!randomPlayer) {
-          console.error(`No hay jugadores para asignar el reto en la sala ${roomCode}`);
-          return;
-        }
-
-        io.to(roomCode).emit('receive_challenge', {
-          challenge: randomChallenge,
-          assignedTo: randomPlayer.username
-        });
+      const membership = await pool.query(
+        `SELECT u.username FROM game_sessions s
+         JOIN session_players sp ON sp.session_id = s.id
+         JOIN users u ON u.id = sp.user_id
+         WHERE s.code = $1 AND s.status = 'waiting' AND u.id = $2`,
+        [roomCode, userId]
+      );
+      if (!socket.connected) return;
+      if (!membership.rows[0]) {
+        reject('No estás registrado en esta sala.');
+        return;
       }
-    } catch (error) {
-      console.error('Error al asignar reto inicial al unirse:', error);
-    }
-  });  
 
-  socket.on('request_challenge', async (roomCode: string) => {
-    try {
-      const result = await pool.query('SELECT * FROM challenges ORDER BY RANDOM() LIMIT 1');
-      if (result.rows.length > 0) {
-        const randomChallenge = result.rows[0];
-        
-        // Obtenemos los jugadores correctamente de la sala
-        const players = rooms[roomCode]?.players;
-        const randomPlayer = players?.[Math.floor(Math.random() * players.length)];
-        if (!randomPlayer) {
-          console.error(`No hay jugadores para asignar el reto en la sala ${roomCode}`);
-          return;
-        }
-
-        // Mandamos también el tipo y valor de duración al frontend
-        io.to(roomCode).emit('receive_challenge', {
-          challenge: {
-            id: randomChallenge.id,
-            content: randomChallenge.content,            // Usando 'content' como definimos
-            category: randomChallenge.category,
-            intensity_level: randomChallenge.intensity_level,
-            duration_type: randomChallenge.duration_type,   // 'normal', 'rounds', o 'seconds'
-            duration_value: randomChallenge.duration_value  // Valor numérico (ej. 3 rondas o 30 segundos)
-          },
-          assignedTo: randomPlayer.username
-        });
+      let room = rooms.get(roomCode);
+      if (!room) {
+        room = {
+          players: [], hostId: socket.id, status: 'playing', challenge: null, challengeCompleted: false, turnId: null,
+          assignedPlayerId: null, rules: [], timerEndsAt: null, timerStatus: 'idle', advancing: false
+        };
+        rooms.set(roomCode, room);
       }
-    } catch (error) {
-      console.error('Error al solicitar nuevo reto:', error);
+      let player = room.players.find(p => p.id === userId);
+      if (player?.socketId && player.socketId !== socket.id) {
+        reject('Este nombre ya está conectado en la sala.');
+        return;
+      }
+      if (!player) {
+        player = { id: userId, username: membership.rows[0].username, socketId: socket.id, score: 0 };
+        room.players.push(player);
+      } else {
+        player.socketId = socket.id;
+      }
+      if (!room.hostId) room.hostId = socket.id;
+      await socket.join(roomCode);
+      if (!socket.connected || player.socketId !== socket.id) return;
+      callback?.({});
+      emitState(roomCode, room);
+
+      if (!room.challenge && room.status === 'playing' && !room.advancing) {
+        room.advancing = true;
+        try {
+          const challenge = await loadChallenge();
+          const connected = room.players.filter(p => p.socketId !== null);
+          const assigned = connected[Math.floor(Math.random() * connected.length)];
+          if (room.status === 'playing' && !room.challenge && assigned) {
+            setChallenge(room, challenge, assigned);
+            emitState(roomCode, room);
+          }
+        } catch (cause) {
+          console.error('Error al cargar el reto inicial:', cause);
+          io.to(roomCode).emit('game_error', { message: 'No se pudo cargar el reto inicial.' });
+        } finally {
+          room.advancing = false;
+        }
+      }
+    } catch (cause) {
+      console.error('Error al unirse a la sala:', cause);
+      reject('No se pudo conectar a la sala.');
     }
   });
 
-  // Registrar cuando un jugador completa su reto y avisar a la sala
-  socket.on('complete_challenge', (data: { roomCode: string; username: string }) => {
-    const { roomCode, username } = data;
-    console.log(`🎉 ¡${username} completó el reto en la sala ${roomCode}!`);
-
-    io.to(roomCode).emit('challenge_completed', {
-      message: `¡${username} cumplió el reto y se ganó un trago! 🥃`
-    });
+  socket.on('request_challenge', (data: { roomCode: string; turnId: string | null }) => {
+    if (!data) {
+      error(socket, 'Datos de reto inválidos.');
+      return;
+    }
+    const { roomCode, turnId } = data;
+    const room = hostRoom(socket, roomCode);
+    if (room) void nextChallenge(socket, roomCode, room, false, false, turnId);
   });
 
-  // Manejar desconexiones
+  socket.on('complete_challenge', (data: { roomCode: string; turnId: string | null }) => {
+    if (!data) {
+      error(socket, 'Datos de reto inválidos.');
+      return;
+    }
+    const { roomCode, turnId } = data;
+    const room = hostRoom(socket, roomCode);
+    if (room) void nextChallenge(socket, roomCode, room, true, false, turnId);
+  });
+
+  socket.on('start_timer', (roomCode: string) => {
+    const room = hostRoom(socket, roomCode);
+    if (!room) return;
+    if (room.status !== 'playing' || room.challenge?.duration_type !== 'seconds' || room.timerStatus !== 'idle') {
+      error(socket, 'No se puede iniciar el temporizador de este reto.');
+      return;
+    }
+    room.timerEndsAt = Date.now() + room.challenge.duration_value * 1000;
+    room.timerStatus = 'running';
+    emitState(roomCode, room);
+  });
+
+  socket.on('finish_game', (roomCode: string) => {
+    const room = hostRoom(socket, roomCode);
+    if (!room) return;
+    if (room.status !== 'playing') {
+      error(socket, 'La partida ya terminó.');
+      return;
+    }
+    room.status = 'finished';
+    room.challenge = null;
+    room.turnId = null;
+    room.assignedPlayerId = null;
+    room.rules = [];
+    room.timerEndsAt = null;
+    room.timerStatus = 'idle';
+    emitState(roomCode, room);
+  });
+
+  socket.on('start_game', (roomCode: string) => {
+    const room = hostRoom(socket, roomCode);
+    if (room) void nextChallenge(socket, roomCode, room, false, true);
+  });
+
+  socket.on('leave_room', (roomCode: string) => {
+    if (typeof roomCode === 'string') leaveRoom(socket, roomCode);
+  });
+
   socket.on('disconnect', () => {
-    console.log(`Usuario desconectado: ${socket.id}`);
-    
-    for (const [roomCode, room] of Object.entries(rooms)) {
-      const initialLength = room.players.length;
-      
-      room.players = room.players.filter((p) => p.id !== socket.id);
-
-      if (room.players.length !== initialLength) {
-        // Si el que se fue era el host, pasamos el host al siguiente jugador disponible
-        const nextHost = room.players[0];
-        if (room.hostId === socket.id && nextHost) {
-          room.hostId = nextHost.id;
-          console.log(`👑 El host se fue. Nuevo host asignado: ${nextHost.username}`);
-        }
-
-        io.to(roomCode).emit('update_room_state', {
-          players: room.players,
-          hostId: room.hostId
-        });
-      }
-    }
+    for (const roomCode of rooms.keys()) leaveRoom(socket, roomCode);
   });
 });
+
+const timer = setInterval(() => {
+  for (const [roomCode, room] of rooms) {
+    if (room.timerStatus !== 'running' || room.timerEndsAt === null) continue;
+    if (Date.now() >= room.timerEndsAt) room.timerStatus = 'finished';
+    emitState(roomCode, room);
+  }
+}, 1000);
+timer.unref();
 
 server.listen(PORT, () => {
   console.log(`Servidor corriendo con éxito en http://localhost:${PORT}`);
 });
+
+export { io, server };

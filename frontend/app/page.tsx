@@ -3,7 +3,7 @@ import { useState, useEffect, useSyncExternalStore } from 'react';
 import { API_URL, socket } from '@/lib/socket';
 
 interface Challenge {
-  id: number;
+  id: string | number;
   content: string;
   category: string;
   intensity_level: number;
@@ -14,6 +14,29 @@ interface Challenge {
 interface Player {
   id: string;
   username: string;
+  score: number;
+  connected: boolean;
+}
+
+interface ActiveRule {
+  id: string;
+  challengeContent: string;
+  targetUsername: string;
+  remainingRounds: number;
+}
+
+interface RoomState {
+  roomCode: string;
+  players: Player[];
+  hostId: string;
+  status: 'playing' | 'finished';
+  challenge: Challenge | null;
+  challengeCompleted: boolean;
+  turnId: string | null;
+  assignedPlayerId: string | null;
+  rules: ActiveRule[];
+  timerStatus: 'idle' | 'running' | 'finished';
+  timeLeft: number | null;
 }
 
 function subscribeToConnection(onChange: () => void) {
@@ -30,64 +53,44 @@ export default function Home() {
   const [username, setUsername] = useState('');
   const [inputCode, setInputCode] = useState('');
   const [roomCode, setRoomCode] = useState('');
+  const [userId, setUserId] = useState('');
   const [inRoom, setInRoom] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
 
-  // Nuevos estados para juego en vivo
-  const [players, setPlayers] = useState<Player[]>([]);
-  const [currentChallenge, setCurrentChallenge] = useState<Challenge | null>(null);
-  const [assignedPlayer, setAssignedPlayer] = useState<string>('');
-
-  // Estado para llevar la cuenta regresiva en segundos
-  const [timeLeft, setTimeLeft] = useState<number | null>(null);
-
-  const [hostId, setHostId] = useState<string>('');
-  const isHost = socket.id === hostId;
+  const [room, setRoom] = useState<RoomState | null>(null);
+  const players = room?.players ?? [];
+  const currentChallenge = room?.challenge;
+  const assignedPlayer = players.find(player => player.id === room?.assignedPlayerId);
+  const isHost = socket.id === room?.hostId;
 
   useEffect(() => {
-    socket.on('update_players', (roomPlayers: Player[]) => {
-      setPlayers(roomPlayers);
-    });
-
-    socket.on('receive_challenge', (data: { challenge: Challenge; assignedTo: string }) => {
-      setCurrentChallenge(data.challenge);
-      setAssignedPlayer(data.assignedTo);
-
-      // Si el reto es de segundos, inicializamos el contador
-      if (data.challenge.duration_type === 'seconds') {
-        setTimeLeft(data.challenge.duration_value);
-      } else {
-        setTimeLeft(null);
-      }
-    });
-
-    // Escuchar cuando alguien completa el reto
-    socket.on('challenge_completed', (data: { message: string }) => {
-      alert(data.message);
-    });
-
-    socket.on('update_room_state', (data: { players: Player[]; hostId: string }) => {
-      setPlayers(data.players);
-      setHostId(data.hostId);
-    });
+    const onState = (state: RoomState) => {
+      if (state.roomCode === roomCode) setRoom(state);
+    };
+    const onError = (data: { message: string }) => setErrorMsg(data.message);
+    socket.on('update_room_state', onState);
+    socket.on('game_error', onError);
 
     return () => {
-      socket.off('update_players');
-      socket.off('receive_challenge');
-      socket.off('challenge_completed');
-      socket.off('update_room_state');
+      socket.off('update_room_state', onState);
+      socket.off('game_error', onError);
     };
-  }, []);
+  }, [roomCode]);
 
   useEffect(() => {
-    if (timeLeft === null || timeLeft <= 0) return;
-
-    const timer = setInterval(() => {
-      setTimeLeft((prev) => (prev !== null && prev > 0 ? prev - 1 : 0));
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [timeLeft]);
+    if (!inRoom || !roomCode || !userId) return;
+    const join = () => {
+      socket.emit('join_room', { roomCode, userId }, (result: { error?: string }) => {
+        if (result.error) {
+          setErrorMsg(result.error);
+          setInRoom(false);
+        }
+      });
+    };
+    socket.on('connect', join);
+    if (socket.connected) join();
+    return () => { socket.off('connect', join); };
+  }, [inRoom, roomCode, userId]);
 
   const handleCreateRoom = async () => {
     if (!username) {
@@ -100,15 +103,15 @@ export default function Home() {
       const res = await fetch(`${API_URL}/api/games/create`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: 1 }),
+        body: JSON.stringify({ username: username.trim() }),
       });
 
       const data = await res.json();
       if (res.ok) {
         const generatedCode = data.session?.code || data.code;
         setRoomCode(generatedCode);
+        setUserId(String(data.userId));
         setInRoom(true);
-        socket.emit('join_room', { roomCode: generatedCode, username });
       } else {
         setErrorMsg(data.error || 'Error al crear la sala');
       }
@@ -130,14 +133,14 @@ export default function Home() {
       const res = await fetch(`${API_URL}/api/games/join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code, userId: 2 }),
+        body: JSON.stringify({ code, username: username.trim() }),
       });
 
       const data = await res.json();
       if (res.ok) {
         setRoomCode(code);
+        setUserId(String(data.userId));
         setInRoom(true);
-        socket.emit('join_room', { roomCode: code, username });
       } else {
         setErrorMsg(data.error || 'Error al unirse a la sala');
       }
@@ -231,38 +234,58 @@ export default function Home() {
 
             {/* Lista de jugadores conectados en tiempo real */}
             <div className="bg-slate-900/60 border border-slate-800 p-3 rounded-xl text-left">
-              <p className="text-xs font-bold text-slate-400 uppercase mb-2">Jugadores en la sala ({players.length}):</p>
+              <p className="text-xs font-bold text-slate-400 uppercase mb-2">Jugadores en la sala ({players.filter(p => p.connected).length}):</p>
               <div className="flex flex-wrap gap-2">
                 {players.map((p) => (
                   <span key={p.id} className="text-xs bg-purple-950/80 border border-purple-800 text-purple-200 px-3 py-1 rounded-full font-medium">
-                    {p.username} {p.username === username ? '(Tú)' : ''}
+                    {p.username} {p.id === userId ? '(Tú)' : ''} {!p.connected ? '(Desconectado)' : ''} · {p.score} pts
                   </span>
                 ))}
               </div>
             </div>
 
-            {/* Sección para mostrar efectos activos por ronda de los jugadores */}
-            <div className="bg-slate-900/60 border border-slate-800 p-3 rounded-xl text-left space-y-2">
-              <p className="text-xs font-bold text-amber-400 uppercase tracking-wider">🔄 Efectos Activos en la Sala:</p>
-              {/* Aquí mapearemos los efectos activos que lleguen del servidor */}
-              <div className="space-y-1">
-                <div className="text-xs bg-amber-950/40 border border-amber-900/60 text-amber-200 px-3 py-1.5 rounded-lg flex justify-between items-center">
-                  <span><strong>Carlos:</strong> No decir la letra &quot;A&quot;</span>
-                  <span className="font-bold text-amber-400">2 rondas restantes</span>
-                </div>
+            {room?.status === 'playing' && (
+              <div className="bg-slate-900/60 border border-slate-800 p-3 rounded-xl text-left space-y-2">
+                <p className="text-xs font-bold text-amber-400 uppercase tracking-wider">🔄 Reglas Activas en la Sala:</p>
+                {room.rules.length === 0 ? (
+                  <p className="text-xs text-slate-400">No hay reglas activas.</p>
+                ) : room.rules.map(rule => (
+                  <div key={rule.id} className="text-xs bg-amber-950/40 border border-amber-900/60 text-amber-200 px-3 py-1.5 rounded-lg flex justify-between items-center gap-2">
+                    <span><strong>{rule.targetUsername}:</strong> {rule.challengeContent}</span>
+                    <span className="font-bold text-amber-400">{rule.remainingRounds} {rule.remainingRounds === 1 ? 'ronda restante' : 'rondas restantes'}</span>
+                  </div>
+                ))}
               </div>
-            </div>
+            )}
 
-            {/* Tarjeta del Reto */}
             <div className="bg-slate-800 p-6 rounded-2xl shadow-xl space-y-4 border border-slate-700">
-              {currentChallenge ? (
+              {room?.status === 'finished' ? (
+                <div className="space-y-4">
+                  <h3 className="text-xl font-bold text-amber-400">🏆 Podio final</h3>
+                  <ol className="space-y-2 text-left">
+                    {[...players].sort((a, b) => b.score - a.score || a.username.localeCompare(b.username)).map((player, index) => (
+                      <li key={player.id} className="flex justify-between rounded-lg bg-slate-900 px-4 py-2">
+                        <span>{index + 1}. {player.username}</span>
+                        <strong>{player.score} {player.score === 1 ? 'punto' : 'puntos'}</strong>
+                      </li>
+                    ))}
+                  </ol>
+                  <p className="text-sm text-slate-400">La sala sigue abierta para nuevos participantes.</p>
+                  {isHost && (
+                    <button onClick={() => socket.emit('start_game', roomCode)} disabled={!isConnected}
+                      className="w-full bg-purple-700 hover:bg-purple-600 disabled:opacity-50 text-white font-bold py-3 rounded-xl">
+                      Iniciar nueva partida
+                    </button>
+                  )}
+                </div>
+              ) : currentChallenge ? (
                 <div className="bg-slate-900 p-5 rounded-xl border border-slate-800 space-y-3">
                   <div className="flex justify-between items-center">
                     <span className="text-xs uppercase tracking-wider bg-purple-900/50 text-purple-300 px-2.5 py-1 rounded-full font-semibold">
                       {currentChallenge.category} (Nivel {currentChallenge.intensity_level})
                     </span>
                     <span className="text-sm font-bold text-pink-400">
-                      Asignado a: {assignedPlayer}
+                      Asignado a: {assignedPlayer?.username ?? 'Jugador desconectado'}
                     </span>
                   </div>
 
@@ -270,35 +293,22 @@ export default function Home() {
                     {currentChallenge.content}
                   </p>
 
-                  {/* Muestra la cuenta regresiva dinámica */}
                   {currentChallenge.duration_type === 'seconds' && (
-                    <div className={`p-3 rounded-lg text-center font-bold transition-all ${timeLeft === 0
+                    <div className={`p-3 rounded-lg text-center font-bold transition-all ${room?.timerStatus === 'finished'
                       ? 'bg-rose-900 border border-rose-600 text-white animate-bounce'
                       : 'bg-red-950/40 border border-red-800/60 text-red-300 animate-pulse'
                       }`}>
-                      {timeLeft !== null && timeLeft > 0 ? (
-                        <span>⏱️ ¡Tiempo restante: <strong className="text-xl font-mono">{timeLeft}</strong> segundos!</span>
+                      {room?.timerStatus === 'finished' ? (
+                        <span>⏰ ¡Se acabó el tiempo!</span>
                       ) : (
-                        <span>⏰ ¡Se acabó el tiempo! ¡A beber 🥃!</span>
+                        <span>⏱️ Tiempo restante: <strong className="text-xl font-mono">{room?.timeLeft ?? currentChallenge.duration_value}</strong> segundos</span>
                       )}
-                    </div>
-                  )}
-
-                  {/* Panel exclusivo del Anfitrión / Host */}
-                  {isHost && (
-                    <div className="bg-purple-950/40 border border-purple-800/60 p-4 rounded-xl space-y-2 text-left">
-                      <p className="text-xs font-bold text-purple-300 uppercase tracking-wider flex items-center gap-1">
-                        👑 Controles de Anfitrión (Host)
-                      </p>
-                      <button
-                        onClick={() => {
-                          // Aquí dispararemos el evento de terminar ronda o cambiar opciones
-                          alert('Funcionalidad de finalizar ronda en camino');
-                        }}
-                        className="w-full bg-purple-700 hover:bg-purple-600 text-white font-bold py-2 px-3 rounded-lg text-xs transition-all shadow"
-                      >
-                        🏁 Finalizar Ronda y Ver Podio
-                      </button>
+                      {room?.timerStatus === 'idle' && isHost && (
+                        <button onClick={() => socket.emit('start_timer', roomCode)} disabled={!isConnected}
+                          className="block w-full mt-2 bg-red-700 hover:bg-red-600 disabled:opacity-50 text-white py-2 rounded-lg">
+                          Iniciar cuenta regresiva
+                        </button>
+                      )}
                     </div>
                   )}
 
@@ -312,23 +322,38 @@ export default function Home() {
                 <p className="text-center text-slate-400 py-4">Esperando el primer reto...</p>
               )}
 
-              <button
-                onClick={() => socket.emit('request_challenge', roomCode)}
-                className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white font-bold py-3 px-4 rounded-xl shadow-lg transition-all transform active:scale-95"
-              >
-                🎲 ¡Siguiente Reto / Verdad!
-              </button>
+              {room?.status === 'playing' && isHost && (
+                <div className="space-y-2">
+                  <button
+                    onClick={() => socket.emit('request_challenge', { roomCode, turnId: room.turnId })}
+                    disabled={!isConnected}
+                    className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 disabled:opacity-50 text-white font-bold py-3 px-4 rounded-xl"
+                  >
+                    🎲 Siguiente Reto / Verdad
+                  </button>
+                  <button
+                    onClick={() => socket.emit('complete_challenge', { roomCode, turnId: room.turnId })}
+                    disabled={!isConnected || !currentChallenge || room.challengeCompleted}
+                    className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold py-2.5 px-4 rounded-xl"
+                  >
+                    Reto cumplido (+1 punto)
+                  </button>
+                  <button
+                    onClick={() => socket.emit('finish_game', roomCode)}
+                    disabled={!isConnected}
+                    className="w-full bg-purple-700 hover:bg-purple-600 disabled:opacity-50 text-white font-bold py-2 px-3 rounded-lg"
+                  >
+                    Finalizar Juego
+                  </button>
+                </div>
+              )}
 
-              {/* Botón para marcar el reto como cumplido y beber */}
               <button
-                onClick={() => socket.emit('complete_challenge', { roomCode, username })}
-                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2.5 px-4 rounded-xl shadow-md transition-all text-sm active:scale-95"
-              >
-                ¡Reto Cumplido (Beber)!
-              </button>
-
-              <button
-                onClick={() => setInRoom(false)}
+                onClick={() => {
+                  if (socket.connected) socket.emit('leave_room', roomCode);
+                  setInRoom(false);
+                  setRoom(null);
+                }}
                 className="text-sm text-slate-500 hover:text-slate-300 underline transition-colors block mx-auto"
               >
                 Salir de la sala
