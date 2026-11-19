@@ -72,8 +72,9 @@ io.on('connection', (socket) => {
     }
 
     // Si por alguna razón el host actual se salió o no hay, aseguramos uno
-    if (!room.players.some(p => p.id === room.hostId)) {
-      room.hostId = room.players[0].id;
+    const firstPlayer = room.players[0];
+    if (firstPlayer && !room.players.some(p => p.id === room.hostId)) {
+      room.hostId = firstPlayer.id;
     }
 
     console.log(`Usuario ${username} unido a la sala: ${roomCode}`);
@@ -84,20 +85,21 @@ io.on('connection', (socket) => {
       hostId: room.hostId
     });
 
-    // Asignar reto inicial automáticamente al entrar    const randomPlayer = room.players.length > 0 
-      ? room.players[Math.floor(Math.random() * room.players.length)].username 
-      : username;
+    // Asignar reto inicial automáticamente al entrar
     try {
       const result = await pool.query('SELECT * FROM challenges ORDER BY RANDOM() LIMIT 1');
       if (result.rows.length > 0) {
         const randomChallenge = result.rows[0];
-        const randomPlayer = currentPlayers.length > 0 
-          ? currentPlayers[Math.floor(Math.random() * currentPlayers.length)].username 
-          : username;
+        const players = room.players;
+        const randomPlayer = players[Math.floor(Math.random() * players.length)];
+        if (!randomPlayer) {
+          console.error(`No hay jugadores para asignar el reto en la sala ${roomCode}`);
+          return;
+        }
 
         io.to(roomCode).emit('receive_challenge', {
           challenge: randomChallenge,
-          assignedTo: randomPlayer
+          assignedTo: randomPlayer.username
         });
       }
     } catch (error) {
@@ -112,10 +114,12 @@ io.on('connection', (socket) => {
         const randomChallenge = result.rows[0];
         
         // Obtenemos los jugadores correctamente de la sala
-        const players = (roomPlayers[roomCode] as Player[]) || [];
-        const randomPlayer = players.length > 0 
-          ? players[Math.floor(Math.random() * players.length)].username 
-          : 'Alguien';
+        const players = rooms[roomCode]?.players;
+        const randomPlayer = players?.[Math.floor(Math.random() * players.length)];
+        if (!randomPlayer) {
+          console.error(`No hay jugadores para asignar el reto en la sala ${roomCode}`);
+          return;
+        }
 
         // Mandamos también el tipo y valor de duración al frontend
         io.to(roomCode).emit('receive_challenge', {
@@ -127,7 +131,7 @@ io.on('connection', (socket) => {
             duration_type: randomChallenge.duration_type,   // 'normal', 'rounds', o 'seconds'
             duration_value: randomChallenge.duration_value  // Valor numérico (ej. 3 rondas o 30 segundos)
           },
-          assignedTo: randomPlayer
+          assignedTo: randomPlayer.username
         });
       }
     } catch (error) {
@@ -149,17 +153,17 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log(`Usuario desconectado: ${socket.id}`);
     
-    for (const roomCode in rooms) {
-      const room = rooms[roomCode];
+    for (const [roomCode, room] of Object.entries(rooms)) {
       const initialLength = room.players.length;
       
       room.players = room.players.filter((p) => p.id !== socket.id);
 
       if (room.players.length !== initialLength) {
         // Si el que se fue era el host, pasamos el host al siguiente jugador disponible
-        if (room.hostId === socket.id && room.players.length > 0) {
-          room.hostId = room.players[0].id;
-          console.log(`👑 El host se fue. Nuevo host asignado: ${room.players[0].username}`);
+        const nextHost = room.players[0];
+        if (room.hostId === socket.id && nextHost) {
+          room.hostId = nextHost.id;
+          console.log(`👑 El host se fue. Nuevo host asignado: ${nextHost.username}`);
         }
 
         io.to(roomCode).emit('update_room_state', {
